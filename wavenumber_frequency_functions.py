@@ -460,7 +460,7 @@ def spacetime_power(data, segsize=96, noverlap=60, spd=1, latitude_bounds=None, 
     # z_pee is a DataArray w/ coordinate vars for wavenumber & frequency
 
     # average over all available segments and sum over latitude
-    # OUTPOT DEPENDS ON SYMMETRIES
+    # OUTPUT DEPENDS ON SYMMETRIES
     if dosymmetries:
         # multipy by 2 b/c we only used one hemisphere
         z_symmetric = 2.0 * z_pee.isel(lat=z_pee.lat<0).mean(dim='time').sum(dim='lat').squeeze()
