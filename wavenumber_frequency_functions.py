@@ -300,7 +300,7 @@ def spacetime_power(data, segsize=96, noverlap=60, spd=1, latitude_bounds=None, 
     
     data: an xarray DataArray to be analyzed; needs to have (time, lat, lon) dimensions.
     segsize: integer denoting the size of time samples that will be decomposed (typically about 96)
-    noverlap: integer denoting the number of days of overlap from one segment to the next (typically about segsize-60 => 2-month overlap)
+    noverlap: integer denoting the number of days of overlap from one segment to the next
     spd: sampling rate, in "samples per day" (e.g. daily=1, 6-houry=4)
     
     latitude_bounds: a tuple of (southern_extent, northern_extent) to reduce data size.
@@ -377,8 +377,12 @@ def spacetime_power(data, segsize=96, noverlap=60, spd=1, latitude_bounds=None, 
     # testing: pass -- Gets the same result as NCL.
 
     # 2. Windowing with the xarray "rolling" operation, and then limit overlap with `construct` to produce a new dataArray.
+    # WK99 recommend "2-month" overlap
     x_roll = data.rolling(time=segsize, min_periods=segsize)  # WK99 use 96-day window
-    x_win = x_roll.construct("segments", stride=noverlap).dropna("time")  # WK99 say "2-month" overlap
+    assert segsize-noverlap > 0, f"Error, inconsistent specification of segsize and noverlap results in stride of {segsize-noverlap}, but must be > 0."
+    x_win = x_roll.construct("segments")
+    x_win = x_win.isel(time=slice(segsize-1,None,segsize-noverlap))  
+
     logging.debug(f"[spacetime_power] x_win shape is {x_win.shape}")
     # Additional detrend for each segment:
     if  np.logical_not(np.any(np.isnan(x_win))):
