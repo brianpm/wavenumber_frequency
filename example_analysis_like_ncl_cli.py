@@ -97,7 +97,7 @@ def get_data(filename, variablename, hfil=None):
         assert hfil is not None, "When a directory is provided, must also provide a hfil string to search for files."
         fils = Path(filename).glob(f"*.{hfil}.*.nc")
         if fils:
-            ds = xr.open_dataset(sorted(fils))
+            ds = xr.open_mfdataset(sorted(fils))
     else:
         print("ERROR get_data unable to figure out what data to load")
         return None
