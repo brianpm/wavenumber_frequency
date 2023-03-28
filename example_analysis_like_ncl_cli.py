@@ -124,7 +124,12 @@ if __name__ == "__main__":
     # Determine sampling (in samples per day)
     #
     spd = 86400 / (86400.*(data.time[1]-data.time[0]).dt.days + (data.time[1]-data.time[0]).dt.seconds)
-
+    #
+    # We need to have data in memory:
+    if hasattr(data, "compute"):
+        data = data.compute()
+        print("Moved data into memory.")
+    
     #
     # Options ... right now these only go into wk.spacetime_power()
     #
