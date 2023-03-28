@@ -111,7 +111,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("ifil")
     parser.add_argument("vname")
-    parser.add_argument("hfil", required=False)
+    parser.add_argument("-h", "--hfil", required=False)
     args = parser.parse_args()
 
     fili = args.ifil
