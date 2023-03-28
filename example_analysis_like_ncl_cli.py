@@ -123,7 +123,8 @@ if __name__ == "__main__":
     #
     # Determine sampling (in samples per day)
     #
-    spd = 86400 / (86400.*(data.time[1]-data.time[0]).dt.days + (data.time[1]-data.time[0]).dt.seconds)
+    spd = (86400 / (86400.*(data.time[1]-data.time[0]).dt.days + (data.time[1]-data.time[0]).dt.seconds)).astype(int).item()
+    print(f"Determined samples per day = {spd}")
     #
     # We need to have data in memory:
     if hasattr(data, "compute"):
