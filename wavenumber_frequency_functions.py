@@ -2,7 +2,7 @@ import xarray as xr
 import numpy as np
 from scipy.signal import convolve2d, detrend
 import logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 
 def helper():
@@ -254,16 +254,18 @@ def resolveWavesHayashi( varfft: xr.DataArray, nDayWin: int, spd: int ) -> xr.Da
     varspacetime[..., 0:mlon//2, N//2:     ] = varfft[..., mlon//2:0:-1, 0:N//2+1]   # neg.k, 
     varspacetime[..., mlon//2:   , 0:N//2+1] = varfft[..., 0:mlon//2+1,  N//2::-1]   # assign eastward & neg.freq.
     varspacetime[..., mlon//2:   , N//2+1: ] = varfft[..., 0:mlon//2+1, -1:N//2-1:-1] # assign eastward & pos.freq.
-    print(varspacetime.shape)
+    logging.debug(f"[Hayashi] Shape after reordering: {varspacetime.shape}")
+    logging.debug(f"[Hayashi] Sum after reordering: {varspacetime.sum()}")
     #  Create the real power spectrum pee = sqrt(real^2+imag^2)^2
-    logging.debug("calculate power")
+    logging.debug(f"[Hayashi] calculate power by absolute value (i.e. sqrt(real**2 + imag**2))and squaring.")
     pee       = (np.abs(varspacetime))**2
-    logging.debug("put into DataArray")
+    logging.debug(f"[Hayashi] sum of pee {pee.sum()}.")
+    logging.debug(f"[Hayashi] put into DataArray")
     # add meta data for use upon return
     wave      = np.arange(-mlon // 2, (mlon // 2 )+ 1, 1, dtype=int)  
     freq      = np.linspace(-1*nDayWin*spd/2, nDayWin*spd/2, (nDayWin*spd)+1) / nDayWin
 
-    print(f"freq size is {freq.shape}.")
+    logging.debug(f"[Hayashi] freq size is {freq.shape}.")
     odims = list(dimnames)
     odims[-2] = "wavenumber"
     odims[-1] = "frequency"
@@ -277,6 +279,9 @@ def resolveWavesHayashi( varfft: xr.DataArray, nDayWin: int, spd: int ) -> xr.Da
         elif c == "frequency":
             ocoords['frequency'] = freq
     pee = xr.DataArray(pee, dims=odims, coords=ocoords)
+    z = pee.copy()
+    z.loc[{'frequency':0}] = np.nan
+    logging.debug(f"[Hayashi] Sum at the end (removing zero freq): {z.sum().item()}")
     return pee 
 
 
@@ -375,9 +380,11 @@ def spacetime_power(data, segsize=96, noverlap=60, spd=1, latitude_bounds=None, 
     if dosymmetries:
         data = decompose2SymAsym(data)
     # testing: pass -- Gets the same result as NCL.
-
+    logging.debug(f"[spacetime_power] data shape after removing low frequencies: {data.shape}")
+    
     # 2. Windowing with the xarray "rolling" operation, and then limit overlap with `construct` to produce a new dataArray.
     # WK99 recommend "2-month" overlap
+    # Shape of x_win: (_, lat, lon, segments: spd*segsize)
     x_roll = data.rolling(time=segsize, min_periods=segsize)  # WK99 use 96-day window
     assert segsize-noverlap > 0, f"Error, inconsistent specification of segsize and noverlap results in stride of {segsize-noverlap}, but must be > 0."
     x_win = x_roll.construct("segments")
@@ -433,6 +440,10 @@ def spacetime_power(data, segsize=96, noverlap=60, spd=1, latitude_bounds=None, 
                              "lat":x_wintap["lat"],
                              "wavenumber":np.fft.fftfreq(lon_size, 1/lon_size),
                              "frequency":np.fft.fftfreq(segsize, 1/spd)})
+    logging.debug(f"[spacetime_power] SUM OF PSD: {(np.abs(z)**2).sum().item()}")
+    zz = z.copy()
+    zz.loc[{'frequency':0}] = np.nan
+    logging.debug(f"[spacetime_power] SUM OF PSD (remove zero freq): {(np.abs(zz)**2).sum().item()}")
     #
     # The FFT is returned following ``standard order`` which has negative frequencies in second half of array. 
     #
