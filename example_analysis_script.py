@@ -23,7 +23,7 @@ def wf_analysis(x):
     # normalize
     nspec_sym = z2_sym / background 
     nspec_asy = z2_asy / background
-    return nspec_sy, nspec_asy
+    return nspec_asy, nspec_asy
 
 
 def plot_normalized_symmetric_spectrum(s):
