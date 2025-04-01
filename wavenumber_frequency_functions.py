@@ -336,7 +336,9 @@ def spacetime_power(data, segsize=96, noverlap=60, spd=1, latitude_bounds=None, 
         
     """
 
+    # convert from days to time steps
     segsize = spd*segsize
+    noverlap = spd*noverlap
 
     if latitude_bounds is not None:
         assert isinstance(latitude_bounds, tuple)
