@@ -177,6 +177,482 @@ def smooth_wavefreq(data, kern=None, nsmooth=None, freq_ax=None, freq_name=None)
         smthNpass = convolvePosNeg(smthNpass, kern, axnum, nzero)
     return xr.DataArray(smthNpass, dims=data.dims, coords=data.coords)
 
+
+def smooth_wavefreq_frequency_dependent(data, kern=None, freq_bands=None, nsmooth_bands=None, freq_ax=None, freq_name=None):
+    """Apply frequency-dependent smoothing to wavenumber-frequency spectrum.
+
+    This function applies different numbers of smoothing passes to different frequency bands,
+    following the approach from tropical_diagnostics where more smoothing is applied at low
+    frequencies to better capture the background spectral envelope.
+
+    Parameters
+    ----------
+    data : xarray.DataArray
+        Input wavenumber-frequency spectrum to smooth
+    kern : numpy.ndarray, optional
+        Smoothing kernel. If None, uses simple_smooth_kernel() (default: None)
+    freq_bands : list of float, optional
+        Frequency band boundaries in cpd. Default: [0.0, 0.2, 0.5, 2.0]
+        Creates bands: [0.0-0.2), [0.2-0.5), [0.5-2.0]
+    nsmooth_bands : list of int, optional
+        Number of smoothing passes for each frequency band.
+        Default: [100, 50, 20] (more smoothing at low frequencies)
+        Length must be len(freq_bands) - 1
+    freq_ax : int, optional
+        Axis index of frequency dimension (default: None)
+    freq_name : str, optional
+        Name of frequency dimension, preferred over freq_ax (default: None)
+
+    Returns
+    -------
+    xarray.DataArray
+        Smoothed spectrum with same dimensions and coordinates as input
+
+    Notes
+    -----
+    - Applies convolution separately to positive and negative frequencies
+    - Zero frequency is preserved (not smoothed)
+    - Default settings inspired by tropical_diagnostics approach:
+      * Low frequencies (< 0.2 cpd): 100 smoothing passes
+      * Mid frequencies (0.2-0.5 cpd): 50 passes
+      * High frequencies (> 0.5 cpd): 20 passes
+    - This helps the background better capture the spectral envelope at low frequencies
+      where sharp drop-offs can cause artifacts with uniform smoothing
+
+    Examples
+    --------
+    >>> # Use default frequency-dependent smoothing
+    >>> bg = smooth_wavefreq_frequency_dependent(spectrum, freq_name='frequency')
+    >>>
+    >>> # Custom frequency bands and smoothing
+    >>> bg = smooth_wavefreq_frequency_dependent(
+    ...     spectrum,
+    ...     freq_bands=[0.0, 0.1, 0.3, 1.0],
+    ...     nsmooth_bands=[150, 75, 30],
+    ...     freq_name='frequency'
+    ... )
+    """
+    assert isinstance(data, xr.DataArray), "Input data must be xarray.DataArray"
+
+    # Set defaults
+    if kern is None:
+        kern = simple_smooth_kernel()
+
+    if freq_bands is None:
+        # Default bands based on tropical_diagnostics approach
+        freq_bands = [0.0, 0.2, 0.5, 2.0]
+
+    if nsmooth_bands is None:
+        # Default: more smoothing at low frequencies
+        nsmooth_bands = [100, 50, 20]
+
+    # Validate inputs
+    if len(nsmooth_bands) != len(freq_bands) - 1:
+        raise ValueError(
+            f"nsmooth_bands length ({len(nsmooth_bands)}) must be "
+            f"len(freq_bands) - 1 ({len(freq_bands) - 1})"
+        )
+
+    # Get frequency dimension info
+    if freq_name is not None:
+        axnum = list(data.dims).index(freq_name)
+        nzero = data.sizes[freq_name] // 2  # Index at freq == 0.0
+        freq_coord = data[freq_name].values
+    elif freq_ax is not None:
+        axnum = freq_ax
+        nzero = data.shape[freq_ax] // 2
+        freq_coord = data.coords[data.dims[freq_ax]].values
+    else:
+        raise ValueError(
+            "smooth_wavefreq_frequency_dependent needs freq_name or freq_ax"
+        )
+
+    # Sort bands by number of smoothing passes (ascending)
+    # This allows us to apply smoothing incrementally
+    sorted_indices = np.argsort(nsmooth_bands)
+
+    # Create mapping of frequency index to target smoothing passes
+    freq_abs = np.abs(freq_coord)
+    target_smoothing = np.zeros(len(freq_coord), dtype=int)
+
+    for i, (f_low, f_high) in enumerate(zip(freq_bands[:-1], freq_bands[1:])):
+        band_mask = (freq_abs >= f_low) & (freq_abs < f_high)
+        target_smoothing[band_mask] = nsmooth_bands[i]
+
+    # Initialize with input data
+    result = data.values.copy()
+
+    # Apply smoothing incrementally
+    # Start with minimum smoothing, then add more for bands that need it
+    smoothing_levels = sorted(set(nsmooth_bands))
+
+    for level_idx, current_level in enumerate(smoothing_levels):
+        if level_idx == 0:
+            # Apply initial smoothing passes
+            n_passes = current_level
+        else:
+            # Apply additional passes beyond previous level
+            n_passes = current_level - smoothing_levels[level_idx - 1]
+
+        # Apply n_passes of smoothing to entire array
+        for _ in range(n_passes):
+            result = convolvePosNeg(result, kern, axnum, nzero)
+
+        # If this is not the maximum level, we need to save this state
+        # for frequencies that should have exactly this much smoothing
+        if level_idx < len(smoothing_levels) - 1:
+            # Identify which frequencies should stop at this level
+            freq_mask = (target_smoothing == current_level)
+
+            if np.any(freq_mask):
+                # Save current smoothed state for these frequencies
+                # We'll need to restore them after further smoothing
+                slc = [slice(None)] * result.ndim
+                slc[axnum] = freq_mask
+                # Store this in a temporary array for later restoration
+                if level_idx == 0:
+                    saved_states = {}
+                saved_states[current_level] = result[tuple(slc)].copy()
+
+    # Now restore the saved states for frequencies that needed less smoothing
+    if len(smoothing_levels) > 1:
+        for level in smoothing_levels[:-1]:  # Skip the maximum level
+            freq_mask = (target_smoothing == level)
+            if np.any(freq_mask):
+                slc = [slice(None)] * result.ndim
+                slc[axnum] = freq_mask
+                result[tuple(slc)] = saved_states[level]
+
+    return xr.DataArray(result, dims=data.dims, coords=data.coords)
+
+
+def estimate_background_parametric(data, method='polynomial', poly_degree=3,
+                                   initial_smooth_passes=20, freq_ax=None, freq_name=None):
+    """Estimate background spectrum using parametric model fitting.
+
+    This function fits a smooth parametric model to the spectrum to estimate the
+    background, which can better capture gradual spectral envelopes than pure smoothing,
+    especially when the spectrum has sharp features at low frequencies.
+
+    Parameters
+    ----------
+    data : xarray.DataArray
+        Input wavenumber-frequency spectrum
+    method : str, optional
+        Parametric model type. Options:
+        - 'polynomial': 2D polynomial surface fit (default)
+        - 'rednoise': Red-noise model fit
+        - 'hybrid': Polynomial at low freq, smoothing at high freq
+    poly_degree : int, optional
+        Degree of polynomial for 'polynomial' method (default: 3)
+        Higher degree captures more spectral structure
+    initial_smooth_passes : int, optional
+        Number of smoothing passes to apply before fitting (default: 20)
+        Removes fine-scale wave features before model fitting
+    freq_ax : int, optional
+        Axis index of frequency dimension
+    freq_name : str, optional
+        Name of frequency dimension, preferred over freq_ax
+
+    Returns
+    -------
+    xarray.DataArray
+        Estimated background spectrum with same dimensions as input
+
+    Notes
+    -----
+    - First applies moderate smoothing to remove wave signatures
+    - Then fits parametric model to capture broad spectral envelope
+    - Handles sharp spectral features better than pure smoothing
+    - Zero frequency is excluded from fitting and set to original value
+
+    The polynomial method fits:
+        log(P) = sum_{i,j} c_ij * k^i * f^j
+    where k is wavenumber, f is frequency, and c_ij are coefficients
+
+    Examples
+    --------
+    >>> # Polynomial background (recommended for sharp low-freq features)
+    >>> bg = estimate_background_parametric(spectrum, method='polynomial',
+    ...                                      poly_degree=3, freq_name='frequency')
+    >>>
+    >>> # Hybrid approach
+    >>> bg = estimate_background_parametric(spectrum, method='hybrid',
+    ...                                      freq_name='frequency')
+    """
+    assert isinstance(data, xr.DataArray), "Input must be xarray.DataArray"
+
+    # Get frequency dimension info
+    if freq_name is not None:
+        axnum = list(data.dims).index(freq_name)
+        nzero = data.sizes[freq_name] // 2
+        freq_coord = data[freq_name].values
+        freq_dim_name = freq_name
+    elif freq_ax is not None:
+        axnum = freq_ax
+        nzero = data.shape[freq_ax] // 2
+        freq_dim_name = data.dims[freq_ax]
+        freq_coord = data.coords[freq_dim_name].values
+    else:
+        raise ValueError("Need freq_name or freq_ax")
+
+    # Get wavenumber dimension (assume it's the other dimension for 2D data)
+    wn_dim_idx = 1 - axnum  # For 2D: if freq is dim 0, wn is dim 1, and vice versa
+    wn_dim_name = data.dims[wn_dim_idx]
+    wn_coord = data[wn_dim_name].values
+
+    # Step 1: Apply initial smoothing to remove wave features
+    print(f"  Applying {initial_smooth_passes} smoothing passes...")
+    smoothed = smooth_wavefreq(data, nsmooth=initial_smooth_passes,
+                               freq_name=freq_dim_name)
+
+    if method == 'polynomial':
+        print(f"  Fitting {poly_degree}-degree 2D polynomial model...")
+        background = _fit_polynomial_background(
+            smoothed, wn_coord, freq_coord, poly_degree,
+            axnum, nzero, freq_dim_name, wn_dim_name
+        )
+    elif method == 'rednoise':
+        print("  Fitting red-noise model...")
+        background = _fit_rednoise_background(
+            smoothed, wn_coord, freq_coord,
+            axnum, nzero, freq_dim_name, wn_dim_name
+        )
+    elif method == 'hybrid':
+        print("  Fitting hybrid model (polynomial low-freq, smoothing high-freq)...")
+        background = _fit_hybrid_background(
+            smoothed, data, wn_coord, freq_coord, poly_degree,
+            axnum, nzero, freq_dim_name, wn_dim_name
+        )
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    return background
+
+
+def _fit_polynomial_background(data, wn_coord, freq_coord, degree, freq_ax, nzero, freq_dim, wn_dim):
+    """Fit 2D polynomial to log-spectrum."""
+    from scipy import optimize
+
+    # Create meshgrid
+    if freq_ax == 0:
+        # data is (frequency, wavenumber)
+        freq_mesh, wn_mesh = np.meshgrid(freq_coord, wn_coord, indexing='ij')
+    else:
+        # data is (wavenumber, frequency)
+        wn_mesh, freq_mesh = np.meshgrid(wn_coord, freq_coord, indexing='ij')
+
+    # Use absolute frequency for fitting (symmetric about zero)
+    freq_abs = np.abs(freq_mesh)
+
+    # Exclude zero frequency and any NaN/inf values
+    valid_mask = (freq_abs > 0) & np.isfinite(data.values) & (data.values > 0)
+
+    # Take log of spectrum for fitting (red noise is linear in log space)
+    log_data = np.log(data.values)
+
+    # Prepare data for fitting
+    freq_fit = freq_abs[valid_mask].flatten()
+    wn_fit = wn_mesh[valid_mask].flatten()
+    log_power_fit = log_data[valid_mask].flatten()
+
+    # Normalize coordinates for better numerical stability
+    freq_scale = np.max(freq_abs)
+    wn_scale = np.max(np.abs(wn_mesh))
+    freq_norm = freq_fit / freq_scale
+    wn_norm = wn_fit / wn_scale
+
+    # Build design matrix for polynomial fit
+    # Fit: log(P) = c00 + c10*k + c01*f + c20*k^2 + c11*k*f + c02*f^2 + ...
+    n_terms = (degree + 1) * (degree + 2) // 2  # Number of terms in 2D polynomial
+    X = np.zeros((len(freq_norm), n_terms))
+
+    term_idx = 0
+    for total_degree in range(degree + 1):
+        for k_deg in range(total_degree + 1):
+            f_deg = total_degree - k_deg
+            X[:, term_idx] = (wn_norm ** k_deg) * (freq_norm ** f_deg)
+            term_idx += 1
+
+    # Solve least squares: X * coeffs = log_power
+    coeffs, residuals, rank, s = np.linalg.lstsq(X, log_power_fit, rcond=None)
+
+    # Evaluate polynomial on full grid
+    X_full = np.zeros((freq_abs.size, n_terms))
+    freq_norm_full = (freq_abs / freq_scale).flatten()
+    wn_norm_full = (wn_mesh / wn_scale).flatten()
+
+    term_idx = 0
+    for total_degree in range(degree + 1):
+        for k_deg in range(total_degree + 1):
+            f_deg = total_degree - k_deg
+            X_full[:, term_idx] = (wn_norm_full ** k_deg) * (freq_norm_full ** f_deg)
+            term_idx += 1
+
+    log_background = (X_full @ coeffs).reshape(data.shape)
+    background = np.exp(log_background)
+
+    # Set zero frequency to NaN (will be handled by normalization later)
+    if freq_ax == 0:
+        background[nzero, :] = np.nan
+    else:
+        background[:, nzero] = np.nan
+
+    return xr.DataArray(background, dims=data.dims, coords=data.coords)
+
+
+def _fit_rednoise_background(data, wn_coord, freq_coord, freq_ax, nzero, freq_dim, wn_dim):
+    """Fit red-noise model: P(k,f) = A(k) / (1 + (f/f0(k))^beta)."""
+    # This is a simplified version - fit frequency spectrum for each wavenumber
+
+    if freq_ax == 0:
+        # data is (frequency, wavenumber)
+        background = np.zeros_like(data.values)
+
+        for k_idx in range(len(wn_coord)):
+            freq_spectrum = data.values[:, k_idx]
+            valid_mask = (np.abs(freq_coord) > 0) & np.isfinite(freq_spectrum) & (freq_spectrum > 0)
+
+            if np.sum(valid_mask) > 3:
+                # Fit simple power law: P ~ f^(-beta)
+                freq_valid = np.abs(freq_coord[valid_mask])
+                power_valid = freq_spectrum[valid_mask]
+
+                # Log-linear fit
+                log_f = np.log(freq_valid)
+                log_p = np.log(power_valid)
+                coeffs = np.polyfit(log_f, log_p, 1)  # Linear in log space
+
+                # Evaluate on full frequency range (excluding zero)
+                log_bg = coeffs[0] * np.log(np.abs(freq_coord) + 1e-10) + coeffs[1]
+                background[:, k_idx] = np.exp(log_bg)
+            else:
+                background[:, k_idx] = np.nanmean(freq_spectrum)
+
+            background[nzero, k_idx] = np.nan
+    else:
+        # data is (wavenumber, frequency)
+        background = np.zeros_like(data.values)
+
+        for k_idx in range(len(wn_coord)):
+            freq_spectrum = data.values[k_idx, :]
+            valid_mask = (np.abs(freq_coord) > 0) & np.isfinite(freq_spectrum) & (freq_spectrum > 0)
+
+            if np.sum(valid_mask) > 3:
+                freq_valid = np.abs(freq_coord[valid_mask])
+                power_valid = freq_spectrum[valid_mask]
+
+                log_f = np.log(freq_valid)
+                log_p = np.log(power_valid)
+                coeffs = np.polyfit(log_f, log_p, 1)
+
+                log_bg = coeffs[0] * np.log(np.abs(freq_coord) + 1e-10) + coeffs[1]
+                background[k_idx, :] = np.exp(log_bg)
+            else:
+                background[k_idx, :] = np.nanmean(freq_spectrum)
+
+            background[k_idx, nzero] = np.nan
+
+    return xr.DataArray(background, dims=data.dims, coords=data.coords)
+
+
+def _fit_hybrid_background(smoothed, original, wn_coord, freq_coord, poly_degree,
+                           freq_ax, nzero, freq_dim, wn_dim):
+    """Hybrid: extrapolate from smoothed background at very low freq, use smoothing elsewhere."""
+    # Only fit to very low frequencies to avoid polynomial extrapolation issues
+    # Transition frequency (cpd) - use polynomial only below this
+    f_fit_max = 0.05  # Only fit polynomial to frequencies below 0.05 cpd
+    f_transition = 0.08  # Blend to pure smoothing by 0.08 cpd
+
+    # Fit polynomial ONLY to low-frequency portion of the smoothed spectrum
+    freq_abs = np.abs(freq_coord)
+
+    # Create a modified smoothed spectrum where we only fit low frequencies
+    low_freq_mask = freq_abs <= f_fit_max
+
+    # For polynomial fitting, we'll fit only to the low-frequency region
+    # but evaluate on all frequencies
+    if freq_ax == 0:
+        # data is (frequency, wavenumber)
+        freq_mesh, wn_mesh = np.meshgrid(freq_coord, wn_coord, indexing='ij')
+    else:
+        # data is (wavenumber, frequency)
+        wn_mesh, freq_mesh = np.meshgrid(wn_coord, freq_coord, indexing='ij')
+
+    freq_abs_mesh = np.abs(freq_mesh)
+
+    # Build constraint: polynomial should match smoothed background at f_fit_max
+    # Simple approach: fit polynomial to smoothed values at low freq
+    valid_mask = (freq_abs_mesh > 0) & (freq_abs_mesh <= f_fit_max) & np.isfinite(smoothed.values) & (smoothed.values > 0)
+
+    if np.sum(valid_mask) < 10:
+        # Not enough points, just return smoothed
+        return smoothed
+
+    log_data = np.log(smoothed.values)
+
+    freq_fit = freq_abs_mesh[valid_mask].flatten()
+    wn_fit = wn_mesh[valid_mask].flatten()
+    log_power_fit = log_data[valid_mask].flatten()
+
+    # Normalize
+    freq_scale = f_fit_max
+    wn_scale = np.max(np.abs(wn_mesh))
+    freq_norm = freq_fit / freq_scale
+    wn_norm = wn_fit / wn_scale
+
+    # Use simpler polynomial (degree 2 or less) to avoid overfitting
+    fit_degree = min(poly_degree, 2)
+    n_terms = (fit_degree + 1) * (fit_degree + 2) // 2
+    X = np.zeros((len(freq_norm), n_terms))
+
+    term_idx = 0
+    for total_degree in range(fit_degree + 1):
+        for k_deg in range(total_degree + 1):
+            f_deg = total_degree - k_deg
+            X[:, term_idx] = (wn_norm ** k_deg) * (freq_norm ** f_deg)
+            term_idx += 1
+
+    coeffs, residuals, rank, s = np.linalg.lstsq(X, log_power_fit, rcond=None)
+
+    # Evaluate polynomial on full grid
+    X_full = np.zeros((freq_abs_mesh.size, n_terms))
+    freq_norm_full = (freq_abs_mesh / freq_scale).flatten()
+    wn_norm_full = (wn_mesh / wn_scale).flatten()
+
+    term_idx = 0
+    for total_degree in range(fit_degree + 1):
+        for k_deg in range(total_degree + 1):
+            f_deg = total_degree - k_deg
+            X_full[:, term_idx] = (wn_norm_full ** k_deg) * (freq_norm_full ** f_deg)
+            term_idx += 1
+
+    log_poly_bg = (X_full @ coeffs).reshape(smoothed.shape)
+    poly_bg = np.exp(log_poly_bg)
+
+    # Blend polynomial and smoothed backgrounds
+    # Use polynomial at very low freq, transition to smoothed
+    weights = (freq_abs_mesh - f_fit_max) / (f_transition - f_fit_max)
+    weights = np.clip(weights, 0, 1)
+
+    # Smooth the weights to avoid sharp transitions
+    from scipy.ndimage import gaussian_filter1d
+    if freq_ax == 0:
+        weights = gaussian_filter1d(weights, sigma=2, axis=0)
+    else:
+        weights = gaussian_filter1d(weights, sigma=2, axis=1)
+
+    background = (1 - weights) * poly_bg + weights * smoothed.values
+
+    # Set zero frequency to NaN
+    if freq_ax == 0:
+        background[nzero, :] = np.nan
+    else:
+        background[:, nzero] = np.nan
+
+    return xr.DataArray(background, dims=smoothed.dims, coords=smoothed.coords)
+
+
 # def smooth_gaussian(data, sigma=1, freq_ax=None, freq_name=None):
 #     '''smoothing using a gaussian filter (from Isla)'''
 #     # fill in k=0 with the average of adjacent values for the purposes of smoothing
