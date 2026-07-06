@@ -26,6 +26,9 @@ RIOS_BERRIOS_FILTERS: Mapping[str, Mapping] = {
     "kelvin":    dict(k_range=(1, 14),  period_range=(2.5, 20.0), direction="eastward"),
     "advective": dict(k_range=(4, 28),  period_range=(2.5, 20.0), direction="westward"),
     "wig_n1":    dict(k_range=(1, 14),  period_range=(1.8, 4.5),  direction="westward"),
+    # MRG (Yanai) n=0 box: Wheeler & Kiladis (1999), Kiladis et al. (2009) he=8-90 m westward branch.
+    # Overlaps advective (k=4-10, T=3-9.6 d) intentionally — consistent with existing filter design.
+    "mrg":       dict(k_range=(1, 10),  period_range=(3.0, 9.6),  direction="westward"),
 }
 
 
